@@ -119,7 +119,7 @@ export const api = {
 };
 
 const apiClient = axios.create({
-  baseURL: 'https://smart-wms-be.p-e.kr/swagger-ui', // EC2 주소 절대 쓰지 않음
+  baseURL: 'https://smart-wms-be.p-e.kr', // EC2 주소 절대 쓰지 않음
   headers: { 'Content-Type': 'application/json' },
   withCredentials: true,
 });
