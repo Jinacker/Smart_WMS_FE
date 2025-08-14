@@ -1,5 +1,5 @@
 {
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "https://smart-wms-be.p-e.kr/api/$1" }
+    { "source": "/api/:path*", "destination": "https://smart-wms-be.p-e.kr/api/:path*" }
   ]
 }

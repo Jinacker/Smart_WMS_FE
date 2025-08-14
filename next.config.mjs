@@ -1,19 +1,8 @@
 /** @type {import('next').NextConfig} */
-
-// 백엔드 주소를 환경변수로도 바꿀 수 있게 처리 (없으면 prod 기본값)
-const BACKEND_URL = process.env.BACKEND_URL || 'https://smart-wms-be.p-e.kr';
-
 const nextConfig = {
-  eslint: {
-    ignoreDuringBuilds: true,
-  },
-  typescript: {
-    ignoreBuildErrors: true,
-  },
-  onDemandEntries: {
-    maxInactiveAge: 25 * 1000,
-    pagesBufferLength: 2,
-  },
+  eslint: { ignoreDuringBuilds: true },
+  typescript: { ignoreBuildErrors: true },
+  onDemandEntries: { maxInactiveAge: 25 * 1000, pagesBufferLength: 2 },
   output: 'standalone',
   swcMinify: true,
   experimental: {
@@ -26,7 +15,6 @@ const nextConfig = {
         fs: false,
       };
     }
-
     config.optimization = {
       ...config.optimization,
       splitChunks: {
@@ -46,39 +34,24 @@ const nextConfig = {
         },
       },
     };
-
     return config;
   },
   images: {
     remotePatterns: [
-      // 프로덕션 BE 이미지
-      {
-        protocol: 'https',
-        hostname: 'smart-wms-be.p-e.kr',
-      },
-      // 로컬 개발 시 이미지 (원하면 주석 해제)
-      // { protocol: 'http', hostname: 'localhost', port: '8080' },
+      { protocol: 'http', hostname: 'localhost', port: '8080' },
     ],
     formats: ['image/webp', 'image/avif'],
     minimumCacheTTL: 86400,
   },
+  // 로컬 개발시에만 /api -> localhost:8080 프록시
   async rewrites() {
-    return [
-      // 모든 프론트 호출은 /api/** 로 때리고 → BE /api/** 로 프록시
-      {
-        source: '/api/:path*',
-        destination: `${BACKEND_URL}/api/:path*`,
-      },
-      // CSRF 엔드포인트 (둘 다 지원)
-      {
-        source: '/csrf',
-        destination: `${BACKEND_URL}/csrf`,
-      },
-      {
-        source: '/api/csrf',
-        destination: `${BACKEND_URL}/csrf`,
-      },
-    ];
+    if (process.env.NODE_ENV === 'development') {
+      return [
+        { source: '/api/:path*', destination: 'http://localhost:8080/api/:path*' },
+      ];
+    }
+    // 프로덕션은 vercel.json이 처리하므로 여기선 빈 배열
+    return [];
   },
 };
 
