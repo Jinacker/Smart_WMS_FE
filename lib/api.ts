@@ -104,8 +104,9 @@ const apiClient = axios.create({
 let CSRF_TOKEN: string | null = null;
 const isSafeMethod = (m?: string) => ['GET', 'HEAD', 'OPTIONS'].includes((m || 'GET').toUpperCase());
 
-async function fetchCsrfToken(): Promise<string> {
-  // 1차: /api/csrf (권장)
+// 교체 전: 실패 시 throw
+// 교체 후: 못 받으면 null 반환하고 조용히 패스
+async function fetchCsrfToken(): Promise<string | null> {
   try {
     const r1 = await fetch('/api/csrf', { credentials: 'include' });
     if (r1.ok) {
@@ -113,52 +114,55 @@ async function fetchCsrfToken(): Promise<string> {
       if (j?.token) return j.token;
     }
   } catch {}
-
-  // 2차: /csrf (백엔드 기본 엔드포인트)
-  const r2 = await fetch('/csrf', { credentials: 'include' });
-  if (r2.ok) {
-    const j = await r2.json();
-    if (j?.token) return j.token;
-  }
-
-  throw new Error('CSRF token endpoint not reachable');
+  try {
+    const r2 = await fetch('/csrf', { credentials: 'include' });
+    if (r2.ok) {
+      const j = await r2.json();
+      if (j?.token) return j.token;
+    }
+  } catch {}
+  return null; // <- 핵심: 실패해도 에러 던지지 않음
 }
 
-// 요청 인터셉터: 변경 메서드에만 CSRF 추가 + 캐시 방지 파라미터
-apiClient.interceptors.request.use(async (config: InternalAxiosRequestConfig) => {
-  // 캐시 방지 타임스템프
+
+// 요청 인터셉터
+apiClient.interceptors.request.use(async (config) => {
   config.params = { ...(config.params || {}), _t: Date.now() };
 
-  if (!isSafeMethod(config.method)) {
-    if (!CSRF_TOKEN) CSRF_TOKEN = await fetchCsrfToken();
-    config.headers = {
-      ...(config.headers || {}),
-      'X-CSRF-TOKEN': CSRF_TOKEN!,
-    };
-  }
+  const method = (config.method || 'GET').toUpperCase();
+  const needsCsrf = !['GET', 'HEAD', 'OPTIONS'].includes(method);
 
+  if (needsCsrf) {
+    if (!CSRF_TOKEN) CSRF_TOKEN = await fetchCsrfToken(); // null일 수도 있음
+    if (CSRF_TOKEN) {
+      config.headers = { ...(config.headers || {}), 'X-CSRF-TOKEN': CSRF_TOKEN };
+    }
+  }
   return config;
 });
 
-// 응답 인터셉터: 403이면 CSRF 갱신 한 번 재시도
+// 응답 인터셉터
 apiClient.interceptors.response.use(
   (r) => r,
-  async (error: AxiosError) => {
-    const original = error.config as InternalAxiosRequestConfig & { _retriedOnce?: boolean };
-    if (error.response?.status === 403 && original && !original._retriedOnce && !isSafeMethod(original.method)) {
-      try {
-        original._retriedOnce = true;
-        CSRF_TOKEN = null;
-        CSRF_TOKEN = await fetchCsrfToken();
-        original.headers = { ...(original.headers || {}), 'X-CSRF-TOKEN': CSRF_TOKEN! };
+  async (error) => {
+    const original: any = error.config || {};
+    const status = error.response?.status;
+    const method = (original.method || 'GET').toUpperCase();
+    const needsCsrf = !['GET', 'HEAD', 'OPTIONS'].includes(method);
+
+    // CSRF 토큰이 있을 법한 상황에서만 1회 재시도
+    if (status === 403 && needsCsrf && !original._retriedOnce) {
+      original._retriedOnce = true;
+      CSRF_TOKEN = await fetchCsrfToken(); // 다시 시도
+      if (CSRF_TOKEN) {
+        original.headers = { ...(original.headers || {}), 'X-CSRF-TOKEN': CSRF_TOKEN };
         return apiClient(original);
-      } catch {
-        // 계속 403이면 그대로 throw
       }
     }
     throw error;
   }
 );
+
 
 // --- 공용 api 래퍼 ---
 export const api = {
