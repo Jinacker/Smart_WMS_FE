@@ -1,0 +1,5 @@
+{
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "https://smart-wms-be.p-e.kr/api/$1" }
+  ]
+}

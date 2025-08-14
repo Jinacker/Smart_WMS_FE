@@ -2,13 +2,12 @@
 
 import { Company } from '@/components/company/company-list';
 import { Item } from '@/components/item/item-list';
-import { InOutRecord, InOutRequest, InventoryItem } from '@/components/utils';
+import { InOutRecord, InventoryItem } from '@/components/utils';
 import { User } from '@/app/(main)/layout';
 
-// --- Types ---
-// 타입을 한 곳에서 관리하여 재사용성을 높입니다.
+import axios, { AxiosError, InternalAxiosRequestConfig } from 'axios';
 
-// Response-specific types
+// --- Types ---
 export interface ItemResponse {
   itemId: number;
   itemName: string;
@@ -77,7 +76,6 @@ export interface DashboardSummaryResponse {
   outboundPending: number;
 }
 
-// The main dashboard data structure
 export interface DashboardData {
   items: ItemResponse[];
   users: UserResponse[];
@@ -88,70 +86,102 @@ export interface DashboardData {
   totalLoadTime: number;
 }
 
+// --- Axios 인스턴스 (세션+CSRF 지원) ---
 
-// import { Schedule } from '@/app/(main)/schedule/page';
-// import { DashboardSummary } from '@/components/dashboard/unified-dashboard'; // Import DashboardSummary type
-type DashboardSummary = any;
-import axios from 'axios';
-
-// --- Dashboard ---
-export async function fetchDashboardSummary(): Promise<DashboardSummary> {
-  const response = await apiClient.get('/api/dashboard/summary');
-  return handleResponse(response);
-}
-
-/*
-export async function fetchDashboardAll(): Promise<DashboardData> {
-  const response = await apiClient.get('/api/dashboard/all');
-  return handleResponse(response);
-}
-*/
-
-export const api = {
-  post: async (url: string, data: any) => {
-    const response = await apiClient.post(url, data);
-    return response.data;
-  },
-  get: async (url: string) => {
-    const response = await apiClient.get(url);
-    return response.data;
-  }
-};
-
+/**
+ * 배포 시에는 vercel.json 리라이트로
+ *   /api/* -> https://smart-wms-be.p-e.kr/api/*
+ * 를 붙일 것이므로, 여기 baseURL은 ''(빈 문자열)로 둔다.
+ * => 기존 코드의 '/api/...' 경로를 그대로 유지 가능.
+ */
 const apiClient = axios.create({
-  baseURL: 'https://smart-wms-be.p-e.kr', // EC2 주소 절대 쓰지 않음
-  headers: { 'Content-Type': 'application/json' },
-  withCredentials: true,
+  baseURL: '',                 // 절대 URL 쓰지 않음. (중요)
+  withCredentials: true,       // 세션 쿠키 주고받기
+  headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
 });
 
-// Add a request interceptor to include the token and prevent caching
-apiClient.interceptors.request.use((config) => {
-  const token = typeof window !== 'undefined' ? localStorage.getItem('authToken') : null;
-  if (token) {
-    config.headers.Authorization = `Bearer ${token}`;
+// ---- CSRF 토큰 자동 주입 ----
+let CSRF_TOKEN: string | null = null;
+const isSafeMethod = (m?: string) => ['GET', 'HEAD', 'OPTIONS'].includes((m || 'GET').toUpperCase());
+
+async function fetchCsrfToken(): Promise<string> {
+  // 1차: /api/csrf (권장)
+  try {
+    const r1 = await fetch('/api/csrf', { credentials: 'include' });
+    if (r1.ok) {
+      const j = await r1.json();
+      if (j?.token) return j.token;
+    }
+  } catch {}
+
+  // 2차: /csrf (백엔드 기본 엔드포인트)
+  const r2 = await fetch('/csrf', { credentials: 'include' });
+  if (r2.ok) {
+    const j = await r2.json();
+    if (j?.token) return j.token;
   }
-  
-  // Add timestamp to prevent caching
-  if (config.params) {
-    config.params._t = Date.now();
-  } else {
-    config.params = { _t: Date.now() };
+
+  throw new Error('CSRF token endpoint not reachable');
+}
+
+// 요청 인터셉터: 변경 메서드에만 CSRF 추가 + 캐시 방지 파라미터
+apiClient.interceptors.request.use(async (config: InternalAxiosRequestConfig) => {
+  // 캐시 방지 타임스템프
+  config.params = { ...(config.params || {}), _t: Date.now() };
+
+  if (!isSafeMethod(config.method)) {
+    if (!CSRF_TOKEN) CSRF_TOKEN = await fetchCsrfToken();
+    config.headers = {
+      ...(config.headers || {}),
+      'X-CSRF-TOKEN': CSRF_TOKEN!,
+    };
   }
-  
+
   return config;
 });
 
+// 응답 인터셉터: 403이면 CSRF 갱신 한 번 재시도
+apiClient.interceptors.response.use(
+  (r) => r,
+  async (error: AxiosError) => {
+    const original = error.config as InternalAxiosRequestConfig & { _retriedOnce?: boolean };
+    if (error.response?.status === 403 && original && !original._retriedOnce && !isSafeMethod(original.method)) {
+      try {
+        original._retriedOnce = true;
+        CSRF_TOKEN = null;
+        CSRF_TOKEN = await fetchCsrfToken();
+        original.headers = { ...(original.headers || {}), 'X-CSRF-TOKEN': CSRF_TOKEN! };
+        return apiClient(original);
+      } catch {
+        // 계속 403이면 그대로 throw
+      }
+    }
+    throw error;
+  }
+);
 
-// Helper function to handle API responses
+// --- 공용 api 래퍼 ---
+export const api = {
+  post: async (url: string, data: any) => (await apiClient.post(url, data)).data,
+  get: async (url: string) => (await apiClient.get(url)).data,
+};
+
+// --- 공통 응답 핸들러 ---
 async function handleResponse<T>(response: { data: T }): Promise<T> {
   return response.data;
+}
+
+// --- Dashboard ---
+export async function fetchDashboardSummary(): Promise<any> {
+  const response = await apiClient.get('/api/dashboard/summary');
+  return handleResponse(response);
 }
 
 // --- Auth ---
 export async function login(username: string, password: string): Promise<{ user: User; message: string }> {
   const response = await apiClient.post('/api/auth/login', { username, password });
   const backendData = response.data;
-  
+
   return {
     message: backendData.message,
     user: {
@@ -162,8 +192,10 @@ export async function login(username: string, password: string): Promise<{ user:
       role: backendData.user.role,
       status: 'ACTIVE',
       lastLogin: new Date().toLocaleString('ko-KR'),
-      createdAt: backendData.user.joinedAt ? new Date(backendData.user.joinedAt).toLocaleDateString('ko-KR') : new Date().toLocaleDateString('ko-KR')
-    }
+      createdAt: backendData.user.joinedAt
+        ? new Date(backendData.user.joinedAt).toLocaleDateString('ko-KR')
+        : new Date().toLocaleDateString('ko-KR'),
+    },
   };
 }
 
@@ -173,10 +205,10 @@ export async function signup(userData: { username: string; password: string; ful
     password: userData.password,
     fullName: userData.fullName,
     email: userData.email,
-    role: 'USER'
+    role: 'USER',
   });
   const backendUser = await handleResponse(response);
-  
+
   return {
     id: backendUser.userId,
     username: backendUser.username,
@@ -184,21 +216,17 @@ export async function signup(userData: { username: string; password: string; ful
     fullName: backendUser.fullName,
     role: backendUser.role,
     status: backendUser.status,
-    lastLogin: backendUser.lastLogin ? new Date(backendUser.lastLogin).toLocaleString('ko-KR', {
-      year: 'numeric',
-      month: '2-digit', 
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit'
-    }) : '접속 기록 없음',
-    createdAt: backendUser.joinedAt ? new Date(backendUser.joinedAt).toLocaleDateString('ko-KR') : new Date().toLocaleDateString('ko-KR')
+    lastLogin: backendUser.lastLogin
+      ? new Date(backendUser.lastLogin).toLocaleString('ko-KR', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+      : '접속 기록 없음',
+    createdAt: backendUser.joinedAt ? new Date(backendUser.joinedAt).toLocaleDateString('ko-KR') : new Date().toLocaleDateString('ko-KR'),
   };
 }
 
 export async function checkSession(): Promise<{ user: User }> {
   const response = await apiClient.get('/api/auth/me');
   const backendData = response.data;
-  
+
   return {
     user: {
       id: backendData.user_id,
@@ -208,8 +236,8 @@ export async function checkSession(): Promise<{ user: User }> {
       role: backendData.role,
       status: 'ACTIVE',
       lastLogin: new Date().toLocaleString('ko-KR'),
-      createdAt: backendData.joinedAt ? new Date(backendData.joinedAt).toLocaleDateString('ko-KR') : new Date().toLocaleDateString('ko-KR')
-    }
+      createdAt: backendData.joinedAt ? new Date(backendData.joinedAt).toLocaleDateString('ko-KR') : new Date().toLocaleDateString('ko-KR'),
+    },
   };
 }
 
@@ -230,42 +258,37 @@ export async function createCompany(companyData: Omit<Company, 'companyId'>): Pr
 
 export async function updateCompany(id: string, companyData: Partial<Company>): Promise<Company> {
   const numericId = Number(id);
-  if (isNaN(numericId)) {
-    throw new Error("Invalid company ID provided for update.");
-  }
+  if (isNaN(numericId)) throw new Error("Invalid company ID provided for update.");
   const response = await apiClient.put(`/api/companies/${numericId}`, companyData);
   return handleResponse(response);
 }
 
 export async function deleteCompany(id: string): Promise<void> {
   const numericId = Number(id);
-  if (isNaN(numericId)) {
-    throw new Error("Invalid company ID provided for delete.");
-  }
+  if (isNaN(numericId)) throw new Error("Invalid company ID provided for delete.");
   await apiClient.delete(`/api/companies/${numericId}`);
 }
 
 // --- Racks ---
 export interface Rack {
   id: number;
-  rackCode: string; // A001~T012
-  section: string; // A~T
-  position: number; // 1~12
+  rackCode: string;
+  section: string;
+  position: number;
   description?: string;
   isActive: boolean;
   createdAt: string;
   updatedAt: string;
-  inventories?: RackInventoryItem[]; // 랙에 포함된 재고 아이템들
+  inventories?: RackInventoryItem[];
 }
 
-// 창고맵을 위한 경량화된 Rack 타입
 export interface RackMapResponse {
   id: number;
-  rackCode: string; // A001~T012
-  section: string; // A~T
-  position: number; // 1~12
+  rackCode: string;
+  section: string;
+  position: number;
   isActive: boolean;
-  hasInventory: boolean; // 재고 유무만 표시
+  hasInventory: boolean;
 }
 
 export async function fetchRacks(): Promise<Rack[]> {
@@ -273,7 +296,6 @@ export async function fetchRacks(): Promise<Rack[]> {
   return handleResponse(response);
 }
 
-// 창고맵을 위한 최적화된 랙 정보 조회 (빠른 로딩)
 export async function fetchRacksForMap(): Promise<RackMapResponse[]> {
   const response = await apiClient.get('/api/racks');
   return handleResponse(response);
@@ -294,7 +316,6 @@ export async function fetchRackInventory(rackCode: string): Promise<RackInventor
   return handleResponse(response);
 }
 
-
 // --- Items ---
 export async function fetchItems(): Promise<Item[]> {
   const response = await apiClient.get('/api/items');
@@ -308,44 +329,33 @@ export async function createItem(itemData: Omit<Item, 'itemId'>): Promise<Item> 
 
 export async function updateItem(id: string, itemData: Partial<Item>): Promise<Item> {
   const numericId = Number(id);
-  if (isNaN(numericId)) {
-    throw new Error("Invalid item ID provided for update.");
-  }
+  if (isNaN(numericId)) throw new Error("Invalid item ID provided for update.");
   const response = await apiClient.put(`/api/items/${numericId}`, itemData);
   return handleResponse(response);
 }
 
 export async function deleteItem(id: string | number): Promise<void> {
   const numericId = Number(id);
-  if (isNaN(numericId) || numericId <= 0) {
-    throw new Error(`Invalid item ID provided for delete: ${id}`);
-  }
+  if (isNaN(numericId) || numericId <= 0) throw new Error(`Invalid item ID provided for delete: ${id}`);
   await apiClient.delete(`/api/items/${numericId}`);
 }
 
-
 // --- InOut ---
-// 원시 API 데이터만 반환 (중복 호출 제거)
 export async function fetchRawInOutData(): Promise<any[]> {
   const response = await apiClient.get('/api/inout/orders');
   return handleResponse(response);
 }
 
-// 기존 함수는 호환성 유지를 위해 유지하되, 단순화
 export async function fetchInOutData(): Promise<InOutRecord[]> {
-  // 원시 데이터만 가져오기 (중복 호출 제거!)
   const allData = await fetchRawInOutData();
-  
-  // Filter for completed records only
   const completedData = allData.filter(record => record.status === 'COMPLETED');
-  
-  // Transform data to match InOutRecord interface (프론트에서 조합)
+
   const transformedData = completedData.flatMap(record => {
     return record.items.map((item, itemIndex) => {
       const dateTime = record.createdAt || record.updatedAt || new Date().toISOString();
       const date = dateTime.split('T')[0];
       const time = dateTime.split('T')[1]?.substring(0, 8) || '00:00:00';
-      
+
       return {
         id: `${record.orderId}-${itemIndex}`,
         type: record.type?.toLowerCase() || 'inbound',
@@ -359,16 +369,15 @@ export async function fetchInOutData(): Promise<InOutRecord[]> {
         companyCode: record.companyCode || 'N/A',
         status: record.status === 'COMPLETED' ? '완료' : '진행 중',
         destination: '-',
-        date: date,
-        time: time,
-        notes: '-'
+        date,
+        time,
+        notes: '-',
       };
     });
   });
-  
+
   return transformedData;
 }
-
 
 export interface InOutOrderItem {
   itemId: number;
@@ -381,78 +390,58 @@ export interface InOutOrderRequest {
   expectedDate: string; // ISO format YYYY-MM-DD
   notes?: string;
   items: InOutOrderItem[];
+  // 위치코드가 스펙에 있으면 타입에 추가
+  locationCode?: string;
 }
 
 export async function createInboundOrder(orderData: { itemId: number; quantity: number; companyId?: number; expectedDate?: string; notes?: string; locationCode?: string }): Promise<any> {
-  const requestData: Omit<InOutOrderRequest, 'destination'> = {
+  const requestData: InOutOrderRequest = {
     type: 'INBOUND',
-    companyId: orderData.companyId || 1, // Default company if not provided
+    companyId: orderData.companyId || 1,
     expectedDate: orderData.expectedDate || new Date().toISOString().split('T')[0],
-    locationCode: orderData.locationCode || 'A-01', // 기본값 설정
+    locationCode: orderData.locationCode || 'A-01',
     notes: orderData.notes,
-    items: [{
-      itemId: orderData.itemId,
-      quantity: orderData.quantity
-    }]
+    items: [{ itemId: orderData.itemId, quantity: orderData.quantity }],
   };
-  
-  // Create the order
+
   const response = await apiClient.post('/api/inout/orders', requestData);
-  const result = await handleResponse(response);
-  
-  return result;
+  return handleResponse(response);
 }
 
-export async function createOutboundOrder(orderData: { 
-  companyId: number; 
-  expectedDate: string; 
+export async function createOutboundOrder(orderData: {
+  companyId: number;
+  expectedDate: string;
   notes?: string;
   type: string;
   status: string;
-  items: Array<{
-    itemId: number;
-    requestedQuantity: number;
-    locationCode: string;
-  }>
+  items: Array<{ itemId: number; requestedQuantity: number; locationCode: string; }>;
 }): Promise<any> {
-  const requestData: Omit<InOutOrderRequest, 'destination'> = {
+  const requestData: InOutOrderRequest = {
     type: 'OUTBOUND',
     companyId: orderData.companyId,
     expectedDate: orderData.expectedDate,
-    locationCode: orderData.items[0]?.locationCode || 'A-01', // 첫 번째 품목의 위치 사용
+    locationCode: orderData.items[0]?.locationCode || 'A-01',
     notes: orderData.notes,
-    items: orderData.items.map(item => ({
-      itemId: item.itemId,
-      quantity: item.requestedQuantity
-    }))
+    items: orderData.items.map(item => ({ itemId: item.itemId, quantity: item.requestedQuantity })),
   };
-  
-  // Create the order
+
   const response = await apiClient.post('/api/inout/orders', requestData);
-  const result = await handleResponse(response);
-  
-  return result;
+  return handleResponse(response);
 }
 
 export async function updateOrderStatus(orderId: string, status: string): Promise<any> {
   const numericOrderId = Number(orderId.split('-')[0]);
-  if (isNaN(numericOrderId)) {
-    throw new Error("Invalid order ID provided for status update.");
-  }
-  const response = await apiClient.put(`/api/inout/orders/${numericOrderId}/status`, {
-    status: status.toUpperCase()
-  });
+  if (isNaN(numericOrderId)) throw new Error("Invalid order ID provided for status update.");
+  const response = await apiClient.put(`/api/inout/orders/${numericOrderId}/status`, { status: status.toUpperCase() });
   return handleResponse(response);
 }
 
-// 승인대기 주문 조회 API 추가
 export async function fetchPendingOrders(): Promise<InOutOrderResponse[]> {
   const response = await apiClient.get('/api/inout/orders?status=PENDING');
   const result = await handleResponse(response);
   return Array.isArray(result) ? result : [];
 }
 
-// 예약된 주문 조회 API 추가  
 export async function fetchReservedOrders(): Promise<InOutOrderResponse[]> {
   const response = await apiClient.get('/api/inout/orders?status=RESERVED');
   const result = await handleResponse(response);
@@ -460,30 +449,18 @@ export async function fetchReservedOrders(): Promise<InOutOrderResponse[]> {
 }
 
 export async function cancelInOutOrder(orderId: string | number): Promise<any> {
-  const numericOrderId = typeof orderId === 'string' 
-    ? Number(orderId.split('-')[0])
-    : Number(orderId);
-  
-  if (isNaN(numericOrderId)) {
-    throw new Error("Invalid order ID provided for cancellation.");
-  }
-  
+  const numericOrderId = typeof orderId === 'string' ? Number(orderId.split('-')[0]) : Number(orderId);
+  if (isNaN(numericOrderId)) throw new Error("Invalid order ID provided for cancellation.");
   const response = await apiClient.put(`/api/inout/orders/${numericOrderId}/cancel`);
   return handleResponse(response);
 }
 
 export async function updateInOutRecord(id: string, recordData: Partial<InOutRecord>): Promise<InOutRecord> {
-  // ID가 "orderId-itemIndex" 형태이므로 orderId만 추출
   const orderId = id.includes('-') ? id.split('-')[0] : id;
   const numericOrderId = Number(orderId);
-  
-  if (isNaN(numericOrderId)) {
-    throw new Error("Invalid InOut record ID provided for update.");
-  }
-  
-  // 여러 가능한 엔드포인트와 메서드 시도
+  if (isNaN(numericOrderId)) throw new Error("Invalid InOut record ID provided for update.");
+
   try {
-    // 1. PUT /api/inout/orders/{id}/status (원래 스펙대로)
     const response = await apiClient.put(`/api/inout/orders/${numericOrderId}/status`, recordData);
     return handleResponse(response);
   } catch (error: any) {
@@ -503,7 +480,6 @@ export async function updateInOutRecord(id: string, recordData: Partial<InOutRec
   }
 }
 
-
 // --- Inventory ---
 export interface BackendInventoryResponse {
   itemId: number;
@@ -513,46 +489,37 @@ export interface BackendInventoryResponse {
   lastUpdated: string;
 }
 
-// 원시 재고 데이터만 반환 (중복 호출 제거)
 export async function fetchRawInventoryData(): Promise<BackendInventoryResponse[]> {
   const response = await apiClient.get('/api/inventory');
   return handleResponse(response);
 }
 
-// 기존 함수는 호환성 유지하되 중복 호출 제거
 export async function fetchInventoryData(): Promise<InventoryItem[]> {
   const backendData = await fetchRawInventoryData();
-  
-  // If no inventory data exists, return empty array
   if (!backendData || backendData.length === 0) {
     console.log('No inventory data found in backend');
     return [];
   }
-  
-  // 기본 변환만 수행 (상세 정보는 React Query에서 조합)
+
   const transformedData: InventoryItem[] = backendData.map((backendItem, index) => {
-    // Determine status based on quantity
     let status = '정상';
-    if (backendItem.quantity <= 0) {
-      status = '위험';
-    } else if (backendItem.quantity <= 10) {
-      status = '부족';
-    }
-    
+    if (backendItem.quantity <= 0) status = '위험';
+    else if (backendItem.quantity <= 10) status = '부족';
+
     return {
       id: index + 1,
       name: backendItem.itemName,
-      sku: `SKU-${backendItem.itemId}`, // 기본값만 사용
-      specification: 'N/A', // 기본값, React Query에서 조합
+      sku: `SKU-${backendItem.itemId}`,
+      specification: 'N/A',
       quantity: backendItem.quantity,
-      inboundScheduled: 0, // React Query에서 계산
-      outboundScheduled: 0, // React Query에서 계산
+      inboundScheduled: 0,
+      outboundScheduled: 0,
       location: backendItem.locationCode,
-      status: status,
-      lastUpdate: new Date(backendItem.lastUpdated).toLocaleString('ko-KR')
+      status,
+      lastUpdate: new Date(backendItem.lastUpdated).toLocaleString('ko-KR'),
     };
   });
-  
+
   return transformedData;
 }
 
@@ -560,15 +527,15 @@ export async function fetchInventoryData(): Promise<InventoryItem[]> {
 export interface Schedule {
   scheduleId: number;
   title: string;
-  startTime: string; // ISO 8601 format
-  endTime: string; // ISO 8601 format
+  startTime: string;
+  endTime: string;
   type: "INBOUND" | "OUTBOUND" | "INVENTORY_CHECK" | "MEETING" | "ETC";
 }
 
 export interface CreateScheduleRequest {
   title: string;
-  startTime: string; // ISO 8601 format
-  endTime: string; // ISO 8601 format
+  startTime: string;
+  endTime: string;
   type: "INBOUND" | "OUTBOUND" | "INVENTORY_CHECK" | "MEETING" | "ETC";
 }
 
@@ -588,33 +555,27 @@ export async function createSchedule(scheduleData: CreateScheduleRequest): Promi
 
 export async function deleteSchedule(id: string | number): Promise<void> {
   const numericId = Number(id);
-  if (isNaN(numericId) || numericId <= 0) {
-    throw new Error(`Invalid schedule ID provided for delete: ${id}`);
-  }
+  if (isNaN(numericId) || numericId <= 0) throw new Error(`Invalid schedule ID provided for delete: ${id}`);
   await apiClient.delete(`/api/schedules/${numericId}`);
 }
 
 // --- Users ---
 export async function fetchUsers(): Promise<User[]> {
-    const response = await apiClient.get('/api/users');
-    const backendUsers = await handleResponse(response);
-    
-    return backendUsers.map((user: any) => ({
-        id: user.userId,
-        username: user.username,
-        email: user.email,
-        fullName: user.fullName,
-        role: user.role,
-        status: user.status,
-        lastLogin: user.lastLogin ? new Date(user.lastLogin).toLocaleString('ko-KR', {
-          year: 'numeric',
-          month: '2-digit', 
-          day: '2-digit',
-          hour: '2-digit',
-          minute: '2-digit'
-        }) : '접속 기록 없음',
-        createdAt: user.joinedAt ? new Date(user.joinedAt).toLocaleDateString('ko-KR') : new Date().toLocaleDateString('ko-KR')
-    }));
+  const response = await apiClient.get('/api/users');
+  const backendUsers = await handleResponse(response);
+
+  return backendUsers.map((user: any) => ({
+    id: user.userId,
+    username: user.username,
+    email: user.email,
+    fullName: user.fullName,
+    role: user.role,
+    status: user.status,
+    lastLogin: user.lastLogin
+      ? new Date(user.lastLogin).toLocaleString('ko-KR', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+      : '접속 기록 없음',
+    createdAt: user.joinedAt ? new Date(user.joinedAt).toLocaleDateString('ko-KR') : new Date().toLocaleDateString('ko-KR'),
+  }));
 }
 
 export async function createUser(userData: Omit<User, 'id'>): Promise<User> {
@@ -623,10 +584,10 @@ export async function createUser(userData: Omit<User, 'id'>): Promise<User> {
     email: userData.email,
     fullName: userData.fullName,
     password: 'defaultPassword123',
-    role: userData.role
+    role: userData.role,
   });
   const backendUser = await handleResponse(response);
-  
+
   return {
     id: backendUser.userId,
     username: backendUser.username,
@@ -634,33 +595,27 @@ export async function createUser(userData: Omit<User, 'id'>): Promise<User> {
     fullName: backendUser.fullName,
     role: backendUser.role,
     status: backendUser.status,
-    lastLogin: backendUser.lastLogin ? new Date(backendUser.lastLogin).toLocaleString('ko-KR', {
-      year: 'numeric',
-      month: '2-digit', 
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit'
-    }) : '접속 기록 없음',
-    createdAt: backendUser.joinedAt ? new Date(backendUser.joinedAt).toLocaleDateString('ko-KR') : new Date().toLocaleDateString('ko-KR')
+    lastLogin: backendUser.lastLogin
+      ? new Date(backendUser.lastLogin).toLocaleString('ko-KR', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+      : '접속 기록 없음',
+    createdAt: backendUser.joinedAt ? new Date(backendUser.joinedAt).toLocaleDateString('ko-KR') : new Date().toLocaleDateString('ko-KR'),
   };
 }
 
 export async function updateUser(id: string, userData: Partial<User>): Promise<User> {
   const numericId = Number(id);
-  if (isNaN(numericId)) {
-    throw new Error("Invalid user ID provided for update.");
-  }
-  
+  if (isNaN(numericId)) throw new Error("Invalid user ID provided for update.");
+
   const updateData: any = {};
   if (userData.username) updateData.username = userData.username;
   if (userData.email) updateData.email = userData.email;
   if (userData.fullName) updateData.fullName = userData.fullName;
   if (userData.role) updateData.role = userData.role;
   if (userData.status) updateData.status = userData.status;
-  
+
   const response = await apiClient.put(`/api/users/${numericId}`, updateData);
   const backendUser = await handleResponse(response);
-  
+
   return {
     id: backendUser.userId,
     username: backendUser.username,
@@ -668,29 +623,20 @@ export async function updateUser(id: string, userData: Partial<User>): Promise<U
     fullName: backendUser.fullName,
     role: backendUser.role,
     status: backendUser.status,
-    lastLogin: backendUser.lastLogin ? new Date(backendUser.lastLogin).toLocaleString('ko-KR', {
-      year: 'numeric',
-      month: '2-digit', 
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit'
-    }) : '접속 기록 없음',
-    createdAt: backendUser.joinedAt ? new Date(backendUser.joinedAt).toLocaleDateString('ko-KR') : new Date().toLocaleDateString('ko-KR')
+    lastLogin: backendUser.lastLogin
+      ? new Date(backendUser.lastLogin).toLocaleString('ko-KR', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+      : '접속 기록 없음',
+    createdAt: backendUser.joinedAt ? new Date(backendUser.joinedAt).toLocaleDateString('ko-KR') : new Date().toLocaleDateString('ko-KR'),
   };
 }
 
 export async function deleteUser(id: string): Promise<void> {
   const numericId = Number(id);
-  if (isNaN(numericId)) {
-    throw new Error("Invalid user ID provided for delete.");
-  }
+  if (isNaN(numericId)) throw new Error("Invalid user ID provided for delete.");
   await apiClient.delete(`/api/users/${numericId}`);
 }
 
 // ===== 통합 대시보드 API =====
-// 5개 개별 API 호출을 1개로 통합하여 75% 성능 향상
-
-// 백엔드 입출고 주문 데이터 타입 정의
 export interface BackendInOutOrderResponse {
   orderId: number;
   type: string;
@@ -723,32 +669,26 @@ export interface DashboardData {
 export async function fetchDashboardAll(): Promise<DashboardData> {
   console.log('🚀 통합 대시보드 API 호출 시작...');
   const startTime = Date.now();
-  
+
   try {
     const response = await apiClient.get('/api/dashboard/all');
     const data = await handleResponse(response);
-    
+
     const loadTime = Date.now() - startTime;
     console.log(`✅ 통합 API 호출 완료: ${loadTime}ms`);
-    
-    return {
-      ...data,
-      totalLoadTime: loadTime
-    };
+
+    return { ...data, totalLoadTime: loadTime };
   } catch (error) {
     const loadTime = Date.now() - startTime;
     console.error(`❌ 통합 API 호출 실패: ${loadTime}ms`, error);
-    
-    // Fallback: 개별 API 호출
     console.log('🔄 개별 API 호출로 fallback 시작...');
     return await fetchDashboardAllFallback();
   }
 }
 
-// Fallback: 통합 API 실패시 개별 API 호출
 async function fetchDashboardAllFallback(): Promise<DashboardData> {
   const startTime = Date.now();
-  
+
   try {
     const [items, users, orders, inventory, schedules, summary] = await Promise.all([
       fetchItems(),
@@ -756,12 +696,12 @@ async function fetchDashboardAllFallback(): Promise<DashboardData> {
       fetchRawInOutData(),
       fetchRawInventoryData(),
       fetchSchedules(),
-      fetchDashboardSummary()
+      fetchDashboardSummary(),
     ]);
-    
+
     const loadTime = Date.now() - startTime;
     console.log(`✅ Fallback API 호출 완료: ${loadTime}ms`);
-    
+
     return {
       items,
       users: users.map(u => ({
@@ -770,13 +710,13 @@ async function fetchDashboardAllFallback(): Promise<DashboardData> {
         email: u.email,
         fullName: u.fullName,
         role: u.role,
-        status: u.status
+        status: u.status,
       })),
       orders,
       inventory,
       schedules,
       summary,
-      totalLoadTime: loadTime
+      totalLoadTime: loadTime,
     };
   } catch (error) {
     const loadTime = Date.now() - startTime;
@@ -784,4 +724,3 @@ async function fetchDashboardAllFallback(): Promise<DashboardData> {
     throw error;
   }
 }
-
